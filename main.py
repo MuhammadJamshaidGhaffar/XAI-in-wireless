@@ -1,353 +1,329 @@
-"""Master continual-learning loop for Graph-RAG RIS-NOMA orchestration."""
-
 from __future__ import annotations
 
+import copy
+import csv
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-import numpy as np
-import pandas as pd
-
-from agent_orchestrator import AgenticOrchestrator
-from graph_memory import GraphRAG
-from physics_env import PhysicsSimulator6G
-from visualizer import generate_master_dashboard, generate_semantic_trace_log
-
-# ------------------------------
-# Global Configuration
-# ------------------------------
-START_FROM_PHASE = 0
-SCENARIOS_PER_PHASE = 20
-LOGS_DIR = "logs"
-SNAPSHOT_DIR = "snapshots"
-FIGURES_DIR = "figures"
-METRICS_CSV = os.path.join(LOGS_DIR, "system_metrics.csv")
-ITERATION_TRACE_CSV = os.path.join(LOGS_DIR, "iteration_traces.csv")
-USE_REAL_LLM = os.environ.get("LOAD_REAL_LLM", "0") == "1"
-
-# Phase control (edit only this flag to resume execution):
-# - 0: run all phases from scratch.
-# - 1: skip Phase 0 and start at Phase 1.
-# - 2: skip Phase 0-1 and start at Phase 2.
-# - 3: load phase2 snapshot and continue from Phase 3.
-# - 4: start directly at Phase 4.
+from agent_orchestrator import AgentOrchestrator
+from memory_manager import ConceptDatabase
+from physics_env import PhysicsEnvironment
+from visualizer import generate_all_plots
 
 
-@dataclass
-class PhaseSpec:
-    """Configuration for one continual-learning phase.
-
-    Attributes:
-        index: Integer phase id.
-        name: Human-readable phase label.
-        active_techs: Solver mode string.
-    """
-
-    index: int
-    name: str
-    active_techs: str
+NUM_EPOCHS = 5
+LOG_CSV_PATH = "artifacts/training_log.csv"
 
 
-PHASES = [
-    PhaseSpec(0, "Phase 0 (Cold Start)", "JOINT_RIS_NOMA"),
-    PhaseSpec(1, "Phase 1 (RIS Only)", "RIS_ONLY"),
-    PhaseSpec(2, "Phase 2 (NOMA Only)", "NOMA_ONLY"),
-    PhaseSpec(3, "Phase 3 (Joint Overlap)", "JOINT_RIS_NOMA"),
-    PhaseSpec(4, "Phase 4 (Joint Mastery)", "JOINT_RIS_NOMA"),
-]
+def _safe_import_llm() -> Any:
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
+
+        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+        use_4bit = bool(torch.cuda.is_available())
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=use_4bit,
+            load_in_8bit=not use_4bit,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=quant_cfg,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        llm_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+        return llm_pipe
+    except Exception as exc:
+        print(f"[WARN] Failed to load DeepSeek pipeline: {exc}")
+        print("[WARN] Continuing with deterministic fallback behavior.")
+        return None
 
 
-def _ensure_dirs() -> None:
-    """Create required filesystem directories."""
-    for path in (LOGS_DIR, SNAPSHOT_DIR, FIGURES_DIR):
-        os.makedirs(path, exist_ok=True)
-
-
-def _snapshot_path(phase_idx: int) -> str:
-    return os.path.join(SNAPSHOT_DIR, f"phase{phase_idx}_memory.pkl")
-
-
-def _load_existing_metrics() -> pd.DataFrame:
-    """Load historical metrics CSV if present."""
-    if os.path.exists(METRICS_CSV):
-        return pd.read_csv(METRICS_CSV)
-    return pd.DataFrame(
-        columns=[
-            "scenario_index",
-            "phase_name",
-            "iterations_to_converge",
-            "sum_rate",
-            "eepsu",
-            "utility_score",
-            "noma_u1_power_ratio",
-            "ris_u3_snr",
-        ]
-    )
-
-
-def _load_existing_iteration_traces() -> pd.DataFrame:
-    """Load historical per-iteration traces if present."""
-    if os.path.exists(ITERATION_TRACE_CSV):
-        return pd.read_csv(ITERATION_TRACE_CSV)
-    return pd.DataFrame(
-        columns=["scenario_index", "phase_name", "iteration", "sum_rate", "init_source"]
-    )
-
-
-def _build_scenario_description(phase: PhaseSpec, local_idx: int) -> str:
-    """Create scenario descriptions that encode phase-specific topology shifts."""
-    if phase.index == 0:
-        return f"Cold-start joint overlap scenario {local_idx}: blocked edge users with unmanaged NOMA interference"
-    if phase.index == 1:
-        return f"RIS-only learning scenario {local_idx}: edge blockage with directional reflection adaptation"
-    if phase.index == 2:
-        return f"NOMA-only learning scenario {local_idx}: near-user SIC balancing with constrained edge links"
-    if phase.index == 3:
-        return f"Joint overlap scenario {local_idx}: RIS steering and NOMA split must co-exist"
-    return f"Unseen joint mastery scenario {local_idx}: robust RIS-NOMA co-optimization required"
-
-
-def _techs_for_phase(phase: PhaseSpec) -> List[str]:
-    if phase.active_techs == "RIS_ONLY":
-        return ["RIS"]
-    if phase.active_techs == "NOMA_ONLY":
-        return ["NOMA"]
-    return ["RIS", "NOMA"]
-
-
-def _phase_seed_init(phase: PhaseSpec, orchestrator: AgenticOrchestrator) -> Dict[str, Any]:
-    """Return deterministic warm starts to enforce requested convergence regimes."""
-    rng = np.random.default_rng(100 + phase.index)
-    if phase.index == 0:
-        return {
-            "noma_power_split": [0.5, 0.5],
-            "ris_phase_matrix": rng.uniform(-np.pi, np.pi, size=128).tolist(),
-            "source": "phase0_cold_start",
-        }
-    if phase.index in {1, 2}:
-        return {
-            "noma_power_split": [0.57, 0.43],
-            "ris_phase_matrix": np.full(128, 0.1).tolist(),
-            "source": "phase_isolated_prior",
-        }
-    if phase.index == 3:
-        return {
-            "noma_power_split": [0.56, 0.44],
-            "ris_phase_matrix": np.full(128, 0.1).tolist(),
-            "source": "phase3_fused_prior",
-        }
+def _scenario_template(
+    category: str,
+    cluster_name: str,
+    idx: int,
+    description: str,
+    d_far_m: float,
+    d_near_m: float,
+    d_bs_ris_m: float,
+    d_ris_u3_m: float,
+    blockage_factor: float,
+    pathloss_exp: float,
+    ris_elements: int,
+    qos_target: float,
+    snr_target: float,
+) -> Dict:
     return {
-        "noma_power_split": [0.58, 0.42],
-        "ris_phase_matrix": np.full(128, 0.1).tolist(),
-        "source": "phase4_mastery_prior",
+        "scenario_id": f"{category}_{cluster_name}_{idx}",
+        "category": category,
+        "cluster": cluster_name,
+        "description": description,
+        "bs_power_dbm": 40.0,
+        "noise_dbm": -94.0,
+        "bandwidth_hz": 20e6,
+        "d_far_m": d_far_m,
+        "d_near_m": d_near_m,
+        "d_bs_ris_m": d_bs_ris_m,
+        "d_ris_u3_m": d_ris_u3_m,
+        "blockage_factor": blockage_factor,
+        "pathloss_exp": pathloss_exp,
+        "ris_elements": ris_elements,
+        "qos_target": qos_target,
+        "snr_target": snr_target,
     }
 
 
-def _coordinator_with_phase_control(
-    orchestrator: AgenticOrchestrator,
-    phase: PhaseSpec,
-    scenario_id: str,
-    scenario_desc: str,
-) -> Dict[str, Any]:
-    """Get coordinator parameters while honoring phase-level behavior requirements."""
-    if phase.index == 0:
-        return _phase_seed_init(phase, orchestrator)
+def build_hierarchical_scenarios() -> Tuple[Dict[str, Dict[str, List[Dict]]], Dict[str, Dict]]:
+    train: Dict[str, Dict[str, List[Dict]]] = {
+        "RIS_ONLY": {
+            "Cluster_Center_Blockage": [
+                _scenario_template("RIS_ONLY", "Cluster_Center_Blockage", i, "RIS center blockage variations", 220, 90, 55, 95 + i, 0.78, 2.4, 160, 8.0, 25.0)
+                for i in range(1, 5)
+            ],
+            "Cluster_High_Correlation": [
+                _scenario_template("RIS_ONLY", "Cluster_High_Correlation", i, "RIS high-correlation angular channel", 230, 95, 60, 100 + i, 0.88, 2.2, 192, 8.5, 26.0)
+                for i in range(1, 4)
+            ],
+            "Cluster_Low_Elevation": [
+                _scenario_template("RIS_ONLY", "Cluster_Low_Elevation", i, "RIS low-elevation reflected path", 210, 85, 48, 90 + i, 0.82, 2.3, 144, 7.8, 24.0)
+                for i in range(1, 4)
+            ],
+        },
+        "NOMA_ONLY": {
+            "Cluster_Power_Imbalance": [
+                _scenario_template("NOMA_ONLY", "Cluster_Power_Imbalance", i, "NOMA power imbalance with varied user offsets", 240 + i * 2, 80 + i, 50, 90, 0.90, 2.2, 64, 9.0, 20.0)
+                for i in range(1, 5)
+            ],
+            "Cluster_SIC_Sensitivity": [
+                _scenario_template("NOMA_ONLY", "Cluster_SIC_Sensitivity", i, "NOMA SIC sensitivity under residual interference", 235 + i, 88 + i, 52, 92, 0.86, 2.3, 64, 9.2, 21.0)
+                for i in range(1, 4)
+            ],
+            "Cluster_Cell_Edge": [
+                _scenario_template("NOMA_ONLY", "Cluster_Cell_Edge", i, "NOMA far-user cell-edge stress", 260 + i * 3, 92 + i, 56, 98, 0.76, 2.5, 64, 9.6, 19.0)
+                for i in range(1, 4)
+            ],
+        },
+        "JOINT": {
+            "Cluster_Interference_Canyon": [
+                _scenario_template("JOINT", "Cluster_Interference_Canyon", i, "Joint RIS-NOMA urban canyon interference", 245 + i, 92 + i, 57, 102 + i, 0.80, 2.4, 192, 10.0, 24.0)
+                for i in range(1, 5)
+            ],
+            "Cluster_MultiPath_Shear": [
+                _scenario_template("JOINT", "Cluster_MultiPath_Shear", i, "Joint sheared multipath with dynamic blockage", 238 + i, 86 + i, 54, 96 + i, 0.84, 2.3, 224, 10.5, 25.0)
+                for i in range(1, 4)
+            ],
+            "Cluster_Dense_Hotspot": [
+                _scenario_template("JOINT", "Cluster_Dense_Hotspot", i, "Joint dense hotspot with reflected congestion", 250 + i * 2, 95 + i, 58, 106 + i, 0.79, 2.5, 256, 11.0, 23.5)
+                for i in range(1, 4)
+            ],
+        },
+    }
 
-    params = orchestrator.coordinator_agent(scenario_id=scenario_id, scenario_desc=scenario_desc)
+    tests = {
+        "TEST_RIS": _scenario_template(
+            "RIS_ONLY",
+            "Extreme_Diagonal_Blockage",
+            1,
+            "Unseen RIS test cluster: extreme diagonal blockage",
+            265,
+            100,
+            68,
+            122,
+            0.62,
+            2.7,
+            256,
+            8.8,
+            27.0,
+        ),
+        "TEST_NOMA": _scenario_template(
+            "NOMA_ONLY",
+            "Asymmetric_Near_Far_Shadowing",
+            1,
+            "Unseen NOMA test cluster: asymmetric near-far shadowing",
+            280,
+            72,
+            45,
+            90,
+            0.70,
+            2.6,
+            64,
+            10.2,
+            18.5,
+        ),
+        "TEST_JOINT": _scenario_template(
+            "JOINT",
+            "Cross_Polarized_MegaBlockage",
+            1,
+            "Unseen JOINT test cluster: cross-polarized mega blockage",
+            275,
+            94,
+            64,
+            130,
+            0.66,
+            2.8,
+            320,
+            11.5,
+            28.0,
+        ),
+    }
+    return train, tests
 
-    # If retrieval is still sparse in early isolated phases, provide stable warm-starts.
-    if phase.index in {1, 2} and params.get("source") == "cold_start":
-        return _phase_seed_init(phase, orchestrator)
 
-    # Phase 3 should avoid catastrophic forgetting spike.
-    if phase.index == 3 and params.get("source") == "cold_start":
-        return _phase_seed_init(phase, orchestrator)
-
-    # Phase 4 should be fully mastered.
-    if phase.index == 4:
-        params.update(_phase_seed_init(phase, orchestrator))
-
-    return params
+def _flatten_cluster_scenarios(category_clusters: Dict[str, List[Dict]]) -> List[Dict]:
+    out: List[Dict] = []
+    for _, scenarios in category_clusters.items():
+        out.extend(scenarios)
+    return out
 
 
-def _save_metrics(df: pd.DataFrame) -> None:
-    """Persist metrics dataframe to CSV."""
-    df.to_csv(METRICS_CSV, index=False)
-    print(f"[INFO - Main] Metrics written to {METRICS_CSV}")
-
-
-def _save_iteration_traces(df: pd.DataFrame) -> None:
-    """Persist iteration-wise sum-rate traces to CSV."""
-    df.to_csv(ITERATION_TRACE_CSV, index=False)
-    print(f"[INFO - Main] Iteration traces written to {ITERATION_TRACE_CSV}")
-
-
-def _run_phase(
-    phase: PhaseSpec,
-    graph: GraphRAG,
-    orchestrator: AgenticOrchestrator,
-    simulator: PhysicsSimulator6G,
-    metrics_df: pd.DataFrame,
-    trace_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Execute one phase and update persistent logs/snapshots.
-
-    Args:
-        phase: Phase specification.
-        graph: Shared GraphRAG instance.
-        orchestrator: LLM-based orchestrator.
-        simulator: Physics simulator instance.
-        metrics_df: Existing metrics table.
-
-    Returns:
-        Updated metrics dataframe and iteration trace dataframe.
-    """
-    print(f"[INFO - Main] Starting {phase.name}")
-
-    next_index = int(metrics_df["scenario_index"].max() + 1) if not metrics_df.empty else 0
-
-    for local_idx in range(SCENARIOS_PER_PHASE):
-        scenario_id = f"p{phase.index}_s{local_idx:03d}"
-        scenario_desc = _build_scenario_description(phase, local_idx)
-        techs_used = _techs_for_phase(phase)
-
-        init_params = _coordinator_with_phase_control(orchestrator, phase, scenario_id, scenario_desc)
-        solver_results = simulator.run_optimization(init_params, phase.active_techs)
-
-        # Force exact phase-4 convergence requirement.
-        if phase.index == 4:
-            solver_results["iterations"] = 1
-            solver_results["utility_score"] = max(solver_results["utility_score"], 0.95)
-
-        eval_payload = orchestrator.evaluator_agent(
-            scenario_id=scenario_id,
-            scenario_desc=scenario_desc,
-            techs_used=techs_used,
-            solver_results=solver_results,
-            utility_score=float(solver_results["utility_score"]),
+def _log_header(csv_path: str) -> None:
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "epoch",
+                "scenario_index",
+                "phase_name",
+                "agent_iterations",
+                "sum_rate",
+                "noma_u1_power_ratio",
+                "ris_u3_snr",
+                "scenario_type",
+                "domain_utility_score",
+            ]
         )
 
-        row = {
-            "scenario_index": next_index,
-            "phase_name": phase.name,
-            "iterations_to_converge": int(solver_results["iterations"]),
-            "sum_rate": float(solver_results["sum_rate"]),
-            "eepsu": float(solver_results["eepsu"]),
-            "utility_score": float(solver_results["utility_score"]),
-            "noma_u1_power_ratio": float(solver_results["final_params"]["noma_power_split"][0]),
-            "ris_u3_snr": float(solver_results["final_sinr"][2]),
-        }
-        metrics_df = pd.concat([metrics_df, pd.DataFrame([row])], ignore_index=True)
 
-        trace_rows = []
-        for point in solver_results.get("iteration_trace", []):
-            trace_rows.append(
-                {
-                    "scenario_index": next_index,
-                    "phase_name": phase.name,
-                    "iteration": int(point["iteration"]),
-                    "sum_rate": float(point["sum_rate"]),
-                    "init_source": str(init_params.get("source", "unknown")),
-                }
-            )
-        if trace_rows:
-            trace_df = pd.concat([trace_df, pd.DataFrame(trace_rows)], ignore_index=True)
-
-        next_index += 1
-
-        # Persist after every scenario step for robust checkpointing.
-        _save_metrics(metrics_df)
-        _save_iteration_traces(trace_df)
-        graph.save_snapshot(_snapshot_path(phase.index))
-
-        if local_idx == SCENARIOS_PER_PHASE - 1:
-            semantic = generate_semantic_trace_log(
-                {
-                    "scenario_desc": scenario_desc,
-                    "retrieved_priors": init_params.get("source", "unknown"),
-                    "final_solver_params": solver_results.get("final_params", {}),
-                    "llm_rationale": eval_payload.get("rationale", "No rationale generated."),
-                }
-            )
-            print(semantic)
-
-    print(f"[INFO - Main] Completed {phase.name}")
-    return metrics_df, trace_df
+def _append_log(csv_path: str, row: Dict) -> None:
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                row["epoch"],
+                row["scenario_index"],
+                row["phase_name"],
+                row["agent_iterations"],
+                row["sum_rate"],
+                row["noma_u1_power_ratio"],
+                row["ris_u3_snr"],
+                row["scenario_type"],
+                row["domain_utility_score"],
+            ]
+        )
 
 
-def _build_sum_rate_curves_from_traces(trace_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Build plot-ready trajectories strictly from logged solver traces."""
-    if trace_df.empty:
-        return {}
-
-    trace_df = trace_df.copy()
-    trace_df["is_cold_start"] = trace_df["init_source"].str.contains("cold_start", case=False, na=False)
-
-    random_df = (
-        trace_df[trace_df["is_cold_start"]]
-        .groupby("iteration", as_index=False)["sum_rate"]
-        .mean()
-        .sort_values("iteration")
+def _log_event(
+    csv_path: str,
+    epoch: int,
+    scenario_index: int,
+    phase_name: str,
+    scenario_type: str,
+    run_output: Dict,
+) -> None:
+    result = run_output["result"]
+    params = run_output["params"]
+    _append_log(
+        csv_path,
+        {
+            "epoch": epoch,
+            "scenario_index": scenario_index,
+            "phase_name": phase_name,
+            "agent_iterations": run_output["agent_iterations"],
+            "sum_rate": result["sum_rate"],
+            "noma_u1_power_ratio": params.get("noma_power_split", result.get("noma_u1_power_ratio", 0.0)),
+            "ris_u3_snr": result["ris_u3_snr"],
+            "scenario_type": scenario_type,
+            "domain_utility_score": result["domain_utility_score"],
+        },
     )
-    graphrag_df = (
-        trace_df[~trace_df["is_cold_start"]]
-        .groupby("iteration", as_index=False)["sum_rate"]
-        .mean()
-        .sort_values("iteration")
-    )
-
-    curves: Dict[str, pd.DataFrame] = {}
-    if not random_df.empty:
-        curves["sum_rate_random"] = random_df
-    if not graphrag_df.empty:
-        curves["sum_rate_graphrag"] = graphrag_df
-    return curves
 
 
 def main() -> None:
-    """Execute the full continual-learning workflow with resume support."""
-    _ensure_dirs()
+    os.makedirs("snapshots", exist_ok=True)
+    os.makedirs("artifacts", exist_ok=True)
 
-    graph = GraphRAG()
-    simulator = PhysicsSimulator6G(seed=123)
-    orchestrator = AgenticOrchestrator(graphrag=graph, load_llm=USE_REAL_LLM)
+    train_sets, tests = build_hierarchical_scenarios()
+    llm_pipe = _safe_import_llm()
 
-    metrics_df = _load_existing_metrics()
-    trace_df = _load_existing_iteration_traces()
+    physics = PhysicsEnvironment()
+    orchestrator = AgentOrchestrator(llm_pipeline=llm_pipe, physics_env=physics)
 
-    if START_FROM_PHASE == 3:
-        phase2_snapshot = _snapshot_path(2)
-        graph.load_snapshot(phase2_snapshot)
-        metrics_df = _load_existing_metrics()
-        trace_df = _load_existing_iteration_traces()
-        print("[INFO - Main] Resumed from Phase 2 snapshot and historical metrics.")
+    ris_db = ConceptDatabase(db_path="snapshots/ris_db.pkl")
+    noma_db = ConceptDatabase(db_path="snapshots/noma_db.pkl")
+    joint_db = ConceptDatabase(db_path="snapshots/joint_db.pkl")
 
-    for phase in PHASES:
-        if phase.index < START_FROM_PHASE:
-            continue
-        metrics_df, trace_df = _run_phase(phase, graph, orchestrator, simulator, metrics_df, trace_df)
+    _log_header(LOG_CSV_PATH)
 
-    # Visualization stage.
-    metrics_df = pd.read_csv(METRICS_CSV)
-    trace_df = pd.read_csv(ITERATION_TRACE_CSV) if os.path.exists(ITERATION_TRACE_CSV) else pd.DataFrame()
-    interference_df = metrics_df[["noma_u1_power_ratio", "ris_u3_snr"]].copy()
+    # Phase 0: Baseline Evaluation (Epoch 0)
+    phase = "Phase 0 Baseline Evaluation"
+    p0_ris = orchestrator.run_agentic_evaluation(tests["TEST_RIS"], ["ris"], ris_db)
+    _log_event(LOG_CSV_PATH, 0, 1, phase, "test_ris", p0_ris)
 
-    data_dict: Dict[str, Any] = {
-        "metrics": metrics_df,
-        "interference": interference_df,
-        "independent_phase_name": "Phase 3 (Joint Overlap)",
-    }
+    p0_noma = orchestrator.run_agentic_evaluation(tests["TEST_NOMA"], ["noma"], noma_db)
+    _log_event(LOG_CSV_PATH, 0, 2, phase, "test_noma", p0_noma)
 
-    sum_rate_curves = _build_sum_rate_curves_from_traces(trace_df)
-    data_dict.update(sum_rate_curves)
+    p0_joint = orchestrator.run_agentic_evaluation(tests["TEST_JOINT"], ["joint"], joint_db)
+    _log_event(LOG_CSV_PATH, 0, 3, phase, "test_joint", p0_joint)
 
-    generate_master_dashboard(
-        data_dict,
-        output_dir=FIGURES_DIR,
-    )
+    # Phase 1: RIS Learning
+    phase = "Phase 1 RIS Learning"
+    ris_train = _flatten_cluster_scenarios(train_sets["RIS_ONLY"])
+    for epoch in range(1, NUM_EPOCHS + 1):
+        for idx, scenario in enumerate(ris_train, start=1):
+            train_out = orchestrator.run_agentic_optimization(scenario, ["ris"], ris_db)
+            _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
 
-    print("[INFO - Main] Execution complete. Snapshots, logs, and figures saved successfully.")
+        eval_out = orchestrator.run_agentic_evaluation(tests["TEST_RIS"], ["ris"], ris_db)
+        _log_event(LOG_CSV_PATH, epoch, 999, phase, "test_ris", eval_out)
+
+    # Phase 2: NOMA Learning
+    phase = "Phase 2 NOMA Learning"
+    noma_train = _flatten_cluster_scenarios(train_sets["NOMA_ONLY"])
+    for epoch in range(1, NUM_EPOCHS + 1):
+        for idx, scenario in enumerate(noma_train, start=1):
+            train_out = orchestrator.run_agentic_optimization(scenario, ["noma"], noma_db)
+            _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
+
+        eval_out = orchestrator.run_agentic_evaluation(tests["TEST_NOMA"], ["noma"], noma_db)
+        _log_event(LOG_CSV_PATH, epoch, 999, phase, "test_noma", eval_out)
+
+    # Phase 3: Zero-Shot Composition
+    phase = "Phase 3 Zero-Shot Composition"
+    joint_db.memory = [dict(x) for x in copy.deepcopy(ris_db.memory)]
+    joint_db._save_to_disk()
+    joint_db.merge_with(noma_db)
+
+    p3_joint = orchestrator.run_agentic_evaluation(tests["TEST_JOINT"], ["joint", "ris", "noma"], joint_db)
+    _log_event(LOG_CSV_PATH, 0, 1, phase, "test_joint_zero_shot", p3_joint)
+
+    # Phase 4: Joint Mastery
+    phase = "Phase 4 Joint Mastery"
+    joint_train = _flatten_cluster_scenarios(train_sets["JOINT"])
+    for epoch in range(1, NUM_EPOCHS + 1):
+        for idx, scenario in enumerate(joint_train, start=1):
+            train_out = orchestrator.run_agentic_optimization(scenario, ["joint", "ris", "noma"], joint_db)
+            _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
+
+        eval_out = orchestrator.run_agentic_evaluation(tests["TEST_JOINT"], ["joint", "ris", "noma"], joint_db)
+        _log_event(LOG_CSV_PATH, epoch, 999, phase, "test_joint", eval_out)
+
+    # Final artifact exports
+    ris_db.export_to_markdown("artifacts/ris_rulebook.md", llm_pipeline=llm_pipe)
+    noma_db.export_to_markdown("artifacts/noma_rulebook.md", llm_pipeline=llm_pipe)
+    joint_db.export_to_markdown("artifacts/joint_rulebook.md", llm_pipeline=llm_pipe)
+
+    # Publication plots
+    generate_all_plots(LOG_CSV_PATH, output_dir="artifacts")
+
+    print("Pipeline complete. Artifacts and logs written to ./artifacts")
 
 
 if __name__ == "__main__":

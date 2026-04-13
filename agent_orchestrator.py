@@ -1,212 +1,246 @@
-"""LLM-based coordinator/evaluator agents for 6G continual orchestration."""
-
 from __future__ import annotations
 
 import json
+import random
 import re
-from typing import Any, Dict, Optional
-
-import numpy as np
-import torch
-
-from graph_memory import GraphRAG
+from typing import Any, Dict, List, Optional
 
 
-class AgenticOrchestrator:
-    """Coordinator and evaluator interface around an instruction-tuned LLM."""
+class AgentOrchestrator:
+    """Coordinator/Evaluator/Librarian loop for cognitive optimization."""
 
-    def __init__(
-        self,
-        graphrag: GraphRAG,
-        model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
-        load_llm: bool = True,
-    ) -> None:
-        """Initialize orchestrator and optionally load the LLM.
-
-        Args:
-            graphrag: Shared GraphRAG memory object.
-            model_name: Hugging Face model identifier.
-            load_llm: Whether to load the actual model or run in mock mode.
-        """
-        self.graphrag = graphrag
-        self.model_name = model_name
-        self.pipeline = None
-        self._mock_mode = not load_llm
-
-        if load_llm:
-            self._init_llm()
-        else:
-            print("[INFO - Orchestrator] Running in mock LLM mode.")
-
-    def _init_llm(self) -> None:
-        """Load Hugging Face pipeline with A100-friendly settings."""
-        try:
-            from transformers import pipeline
-
-            self.pipeline = pipeline(
-                task="text-generation",
-                model=self.model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-            )
-            self._mock_mode = False
-            print("[INFO - Orchestrator] LLM loaded with bfloat16 and device_map=auto.")
-        except Exception as exc:  # pragma: no cover - environment dependent
-            self.pipeline = None
-            self._mock_mode = True
-            print(f"[WARN - Orchestrator] Failed to load LLM; falling back to mock mode. Reason: {exc}")
+    def __init__(self, llm_pipeline: Any, physics_env: Any) -> None:
+        self.llm_pipeline = llm_pipeline
+        self.physics_env = physics_env
+        self._rng = random.Random(42)
 
     @staticmethod
-    def _extract_json_block(text: str) -> Optional[str]:
-        """Extract JSON object string from arbitrary model output.
+    def strip_think_tags(text: str) -> str:
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-        Args:
-            text: Raw generated text.
+    def _call_llm(self, prompt: str, max_new_tokens: int = 350) -> str:
+        if self.llm_pipeline is None:
+            return ""
+        out = self.llm_pipeline(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+        if isinstance(out, list) and out:
+            first = out[0]
+            if isinstance(first, dict):
+                text = first.get("generated_text", "")
+                if isinstance(text, str):
+                    return text[len(prompt) :] if text.startswith(prompt) else text
+        return ""
 
-        Returns:
-            JSON candidate string if found.
-        """
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
-        if fence_match:
-            return fence_match.group(1)
-
-        brace_match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-        if brace_match:
-            return brace_match.group(1)
-        return None
-
-    def generate_json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
-        """Generate and parse strict JSON output from the LLM.
-
-        Args:
-            system_prompt: High-level behavior prompt.
-            user_prompt: Task-specific input.
-
-        Returns:
-            Parsed JSON dictionary.
-        """
-        if self._mock_mode:
-            # Deterministic fallback for testability without model access.
-            if "success" in user_prompt.lower() or "utility" in user_prompt.lower():
-                return {
-                    "success": True,
-                    "rationale": "Utility and convergence indicate robust cross-tech synergy.",
-                    "final_params": {
-                        "noma_power_split": [0.58, 0.42],
-                        "ris_phase_matrix": [0.1] * 128,
-                    },
-                }
-            return {
-                "noma_power_split": [0.56, 0.44],
-                "ris_phase_matrix": [0.0] * 128,
-                "retrieval_used": True,
-            }
-
-        prompt = (
-            f"<|system|>\n{system_prompt}\n"
-            f"<|user|>\n{user_prompt}\n"
-            "Return only JSON without commentary."
-        )
-        output = self.pipeline(prompt, max_new_tokens=512, do_sample=False)
-        generated = output[0]["generated_text"]
-        json_text = self._extract_json_block(generated)
-        if json_text is None:
-            raise ValueError("Failed to locate JSON in model output.")
-
+    def _parse_json(self, text: str) -> Dict:
+        cleaned = self.strip_think_tags(text)
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            return {}
+        payload = cleaned[start : end + 1]
         try:
-            return json.loads(json_text)
+            return json.loads(payload)
         except json.JSONDecodeError:
-            # Light cleanup for common trailing commas or markdown noise.
-            cleaned = re.sub(r",\s*([}\]])", r"\1", json_text)
-            return json.loads(cleaned)
+            return {}
 
-    @staticmethod
-    def _default_random_init() -> Dict[str, Any]:
-        """Return cold-start initialization heuristic."""
-        rng = np.random.default_rng()
-        split = rng.uniform(0.3, 0.7)
+    def _fallback_params(self, scenario: Dict, iteration: int) -> Dict:
+        category = scenario.get("category", "JOINT")
+        base = 0.65 if category in {"NOMA_ONLY", "JOINT"} else 0.5
+        jitter = (self._rng.random() - 0.5) * 0.2
+        noma_power = max(0.05, min(0.95, base + jitter - 0.02 * iteration))
+
         return {
-            "noma_power_split": [float(split), float(1.0 - split)],
-            "ris_phase_matrix": rng.uniform(-np.pi, np.pi, size=128).tolist(),
-            "source": "cold_start",
+            "noma_power_split": noma_power,
+            "ris_phase_offset": max(-3.14, min(3.14, 0.4 - 0.1 * iteration + jitter)),
+            "ris_reflection_amplitude": max(0.1, min(1.0, 0.92 - 0.04 * iteration)),
+            "sic_residual": max(0.01, min(0.3, 0.12 - 0.01 * iteration)),
         }
 
-    def coordinator_agent(self, scenario_id: str, scenario_desc: str) -> Dict[str, Any]:
-        """Produce initialization parameters for the physics solver.
-
-        Args:
-            scenario_id: Scenario identifier.
-            scenario_desc: Natural language description.
-
-        Returns:
-            Initialization parameter dictionary.
-        """
-        retrieved = self.graphrag.retrieve_similar_strategy(scenario_desc)
-        if retrieved is None:
-            print(f"[INFO - Orchestrator] Coordinator cold start for {scenario_id}.")
-            return self._default_random_init()
-
-        system_prompt = (
-            "You are a wireless optimization assistant. Combine retrieved priors "
-            "into an initialization JSON with keys: noma_power_split, ris_phase_matrix."
-        )
-        user_prompt = (
-            f"Scenario: {scenario_desc}\n"
-            f"Retrieved rationale: {retrieved.get('rationale', '')}\n"
-            f"Retrieved params: {json.dumps(retrieved.get('params', {}))}"
-        )
-        proposal = self.generate_json(system_prompt, user_prompt)
-        proposal.setdefault("source", "graphrag_retrieval")
-        print(f"[INFO - Orchestrator] Coordinator generated retrieval-based init for {scenario_id}.")
-        return proposal
-
-    def evaluator_agent(
+    def coordinator_agent(
         self,
-        scenario_id: str,
-        scenario_desc: str,
-        techs_used: list[str],
-        solver_results: Dict[str, Any],
-        utility_score: float,
-    ) -> Dict[str, Any]:
-        """Evaluate solver output and store successful knowledge in GraphRAG.
-
-        Args:
-            scenario_id: Scenario identifier.
-            scenario_desc: Scenario description.
-            techs_used: Active technologies.
-            solver_results: Physics solver output dictionary.
-            utility_score: Composite utility score U.
-
-        Returns:
-            Evaluator decision and rationale dictionary.
-        """
-        system_prompt = (
-            "You are an evaluator for continual 6G optimization. Return JSON with "
-            "keys: success (bool), rationale (str), final_params (dict)."
+        scenario: Dict,
+        active_domains: List[str],
+        active_db: Any,
+        iteration: int,
+        feedback_log: List[Dict],
+    ) -> Dict:
+        retrieved = active_db.retrieve_concepts(
+            query=scenario.get("description", ""),
+            top_k=5,
+            domain_filters=active_domains if active_domains else None,
         )
-        user_prompt = (
-            f"Scenario: {scenario_desc}\n"
-            f"Iterations: {solver_results.get('iterations')}\n"
-            f"SumRate: {solver_results.get('sum_rate')}\n"
-            f"Utility: {utility_score}\n"
-            "Mark success true when utility is strong and convergence is efficient."
+        coordinator_prompt = (
+            "You are the Coordinator Agent for an O-RAN optimization system.\n"
+            "Output STRICT JSON with numeric keys only:\n"
+            "noma_power_split, ris_phase_offset, ris_reflection_amplitude, sic_residual.\n"
+            "Keep values within physical bounds: noma_power_split:[0.05,0.95],"
+            " ris_phase_offset:[-3.14,3.14], ris_reflection_amplitude:[0,1], sic_residual:[0,1].\n"
+            f"Scenario: {json.dumps(scenario)}\n"
+            f"Active Domains: {active_domains}\n"
+            f"Retrieved Concepts: {json.dumps(retrieved)}\n"
+            f"Failure Feedback: {json.dumps(feedback_log[-3:])}\n"
+            "Return JSON only."
         )
-        decision = self.generate_json(system_prompt, user_prompt)
 
-        success = bool(decision.get("success", utility_score > 0.8))
-        if success:
-            final_params = decision.get("final_params", solver_results.get("final_params", {}))
-            rationale = decision.get("rationale", "Successful convergence with balanced interference tradeoff.")
-            self.graphrag.insert_knowledge(
-                scenario_id=scenario_id,
-                scenario_desc=scenario_desc,
-                techs_used=techs_used,
-                strategy_params=final_params,
-                rationale=rationale,
-            )
-            print(f"[INFO - Orchestrator] Evaluator stored successful strategy for {scenario_id}.")
+        llm_text = self._call_llm(coordinator_prompt)
+        parsed = self._parse_json(llm_text)
+        if not parsed:
+            parsed = self._fallback_params(scenario, iteration)
+
+        params = {
+            "noma_power_split": float(parsed.get("noma_power_split", self._fallback_params(scenario, iteration)["noma_power_split"])),
+            "ris_phase_offset": float(parsed.get("ris_phase_offset", self._fallback_params(scenario, iteration)["ris_phase_offset"])),
+            "ris_reflection_amplitude": float(
+                parsed.get("ris_reflection_amplitude", self._fallback_params(scenario, iteration)["ris_reflection_amplitude"])
+            ),
+            "sic_residual": float(parsed.get("sic_residual", self._fallback_params(scenario, iteration)["sic_residual"])),
+        }
+        return params
+
+    def evaluator_agent(self, scenario: Dict, params: Dict, result: Dict) -> Dict:
+        evaluator_prompt = (
+            "You are the Evaluator Agent in an O-RAN cognitive loop.\n"
+            "Write one concise scientific concept explaining why this outcome occurred.\n"
+            "Output STRICT JSON with keys: condition, rule, explanation, policy.\n"
+            f"Scenario: {json.dumps(scenario)}\n"
+            f"Params: {json.dumps(params)}\n"
+            f"Physics Result: {json.dumps(result)}\n"
+            "Return JSON only."
+        )
+        llm_text = self._call_llm(evaluator_prompt)
+        parsed = self._parse_json(llm_text)
+        if parsed:
+            return parsed
+
+        condition = (
+            f"Category={scenario.get('category')} with blockage={scenario.get('blockage_factor')} "
+            f"and ris_elements={scenario.get('ris_elements')} produced U={result.get('domain_utility_score', 0.0):.4f}."
+        )
+        rule = (
+            f"Set noma_power_split={params.get('noma_power_split', 0.65):.3f}, "
+            f"ris_reflection_amplitude={params.get('ris_reflection_amplitude', 0.9):.3f}, "
+            f"sic_residual={params.get('sic_residual', 0.08):.3f} to balance fairness and interference."
+        )
+        return {
+            "condition": condition,
+            "rule": rule,
+            "explanation": "Physics indicates utility responds to power split/SIC/reflection coupling.",
+            "policy": "Adaptive Interference-Reflection Balancing",
+        }
+
+    @staticmethod
+    def librarian_agent(concept: Dict, scenario: Dict) -> Dict:
+        category = scenario.get("category", "JOINT")
+        if category == "RIS_ONLY":
+            domain = "ris"
+        elif category == "NOMA_ONLY":
+            domain = "noma"
         else:
-            print(f"[INFO - Orchestrator] Evaluator rejected strategy for {scenario_id}.")
+            domain = "joint"
+        out = dict(concept)
+        out["domain"] = domain
+        return out
 
-        decision["success"] = success
-        return decision
+    def run_agentic_optimization(
+        self,
+        scenario: Dict,
+        active_domains: List[str],
+        active_db: Any,
+        max_iterations: int = 10,
+        utility_success_threshold: float = 0.70,
+    ) -> Dict:
+        feedback_log: List[Dict] = []
+        final_params: Optional[Dict] = None
+        final_result: Optional[Dict] = None
+        used_iterations = 0
+
+        while used_iterations < max_iterations:
+            used_iterations += 1
+            params = self.coordinator_agent(
+                scenario=scenario,
+                active_domains=active_domains,
+                active_db=active_db,
+                iteration=used_iterations,
+                feedback_log=feedback_log,
+            )
+            result = self.physics_env.evaluate(scenario, params)
+
+            final_params = params
+            final_result = result
+
+            if float(result["domain_utility_score"]) >= utility_success_threshold:
+                break
+
+            feedback_log.append(
+                {
+                    "iteration": used_iterations,
+                    "utility": result["domain_utility_score"],
+                    "sum_rate": result["sum_rate"],
+                    "params": params,
+                }
+            )
+
+        assert final_params is not None and final_result is not None
+
+        concept = self.evaluator_agent(scenario, final_params, final_result)
+        tagged_concept = self.librarian_agent(concept, scenario)
+
+        active_db.learn_concept(
+            condition=tagged_concept.get("condition", ""),
+            rule=tagged_concept.get("rule", ""),
+            utility_score=float(final_result["domain_utility_score"]),
+            domain=tagged_concept.get("domain", "joint"),
+            policy=tagged_concept.get("policy", "Learned Policy"),
+        )
+
+        return {
+            "agent_iterations": used_iterations,
+            "params": final_params,
+            "result": final_result,
+            "concept": tagged_concept,
+        }
+
+    def run_agentic_evaluation(
+        self,
+        scenario: Dict,
+        active_domains: List[str],
+        active_db: Any,
+        max_iterations: int = 10,
+        utility_success_threshold: float = 0.70,
+    ) -> Dict:
+        feedback_log: List[Dict] = []
+        final_params: Optional[Dict] = None
+        final_result: Optional[Dict] = None
+        used_iterations = 0
+
+        while used_iterations < max_iterations:
+            used_iterations += 1
+            params = self.coordinator_agent(
+                scenario=scenario,
+                active_domains=active_domains,
+                active_db=active_db,
+                iteration=used_iterations,
+                feedback_log=feedback_log,
+            )
+            result = self.physics_env.evaluate(scenario, params)
+
+            final_params = params
+            final_result = result
+
+            if float(result["domain_utility_score"]) >= utility_success_threshold:
+                break
+
+            feedback_log.append(
+                {
+                    "iteration": used_iterations,
+                    "utility": result["domain_utility_score"],
+                    "sum_rate": result["sum_rate"],
+                    "params": params,
+                }
+            )
+
+        assert final_params is not None and final_result is not None
+        return {
+            "agent_iterations": used_iterations,
+            "params": final_params,
+            "result": final_result,
+        }
