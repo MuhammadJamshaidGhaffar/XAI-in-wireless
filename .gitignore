@@ -1,0 +1,19 @@
+*.png
+*.jpg
+*.jpeg
+
+# Ingore csv
+*.csv
+
+# Ignore log files
+*.log
+
+# Ignore pkl files
+*.pkl
+
+# Ignore pycache
+**/__pycache__/**
+
+# Ignore virtual environment
+**/venv/**
+
