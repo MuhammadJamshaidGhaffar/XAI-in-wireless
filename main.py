@@ -40,9 +40,7 @@ def _safe_import_llm() -> Any:
         llm_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
         return llm_pipe
     except Exception as exc:
-        print(f"[WARN] Failed to load DeepSeek pipeline: {exc}")
-        print("[WARN] Continuing with deterministic fallback behavior.")
-        return None
+        raise RuntimeError(f"Failed to load DeepSeek pipeline: {exc}") from exc
 
 
 def _scenario_template(
@@ -59,6 +57,9 @@ def _scenario_template(
     ris_elements: int,
     qos_target: float,
     snr_target: float,
+    eepsu_target: float,
+    pws_target: float,
+    fairness_min: float,
 ) -> Dict:
     return {
         "scenario_id": f"{category}_{cluster_name}_{idx}",
@@ -66,6 +67,8 @@ def _scenario_template(
         "cluster": cluster_name,
         "description": description,
         "bs_power_dbm": 40.0,
+        "base_power_dbm_min": 34.0,
+        "base_power_dbm_max": 46.0,
         "noise_dbm": -94.0,
         "bandwidth_hz": 20e6,
         "d_far_m": d_far_m,
@@ -77,6 +80,10 @@ def _scenario_template(
         "ris_elements": ris_elements,
         "qos_target": qos_target,
         "snr_target": snr_target,
+        "eepsu_target": eepsu_target,
+        "pws_target": pws_target,
+        "fairness_min": fairness_min,
+        "max_power_budget": 12.0,
     }
 
 
@@ -84,43 +91,43 @@ def build_hierarchical_scenarios() -> Tuple[Dict[str, Dict[str, List[Dict]]], Di
     train: Dict[str, Dict[str, List[Dict]]] = {
         "RIS_ONLY": {
             "Cluster_Center_Blockage": [
-                _scenario_template("RIS_ONLY", "Cluster_Center_Blockage", i, "RIS center blockage variations", 220, 90, 55, 95 + i, 0.78, 2.4, 160, 8.0, 25.0)
+                _scenario_template("RIS_ONLY", "Cluster_Center_Blockage", i, "RIS center blockage variations", 220, 90, 55, 95 + i, 0.78, 2.4, 160, 8.0, 25.0, 1.60, 3.00, 0.80)
                 for i in range(1, 5)
             ],
             "Cluster_High_Correlation": [
-                _scenario_template("RIS_ONLY", "Cluster_High_Correlation", i, "RIS high-correlation angular channel", 230, 95, 60, 100 + i, 0.88, 2.2, 192, 8.5, 26.0)
+                _scenario_template("RIS_ONLY", "Cluster_High_Correlation", i, "RIS high-correlation angular channel", 230, 95, 60, 100 + i, 0.88, 2.2, 192, 8.5, 26.0, 1.70, 3.30, 0.82)
                 for i in range(1, 4)
             ],
             "Cluster_Low_Elevation": [
-                _scenario_template("RIS_ONLY", "Cluster_Low_Elevation", i, "RIS low-elevation reflected path", 210, 85, 48, 90 + i, 0.82, 2.3, 144, 7.8, 24.0)
+                _scenario_template("RIS_ONLY", "Cluster_Low_Elevation", i, "RIS low-elevation reflected path", 210, 85, 48, 90 + i, 0.82, 2.3, 144, 7.8, 24.0, 1.50, 2.80, 0.80)
                 for i in range(1, 4)
             ],
         },
         "NOMA_ONLY": {
             "Cluster_Power_Imbalance": [
-                _scenario_template("NOMA_ONLY", "Cluster_Power_Imbalance", i, "NOMA power imbalance with varied user offsets", 240 + i * 2, 80 + i, 50, 90, 0.90, 2.2, 64, 9.0, 20.0)
+                _scenario_template("NOMA_ONLY", "Cluster_Power_Imbalance", i, "NOMA power imbalance with varied user offsets", 240 + i * 2, 80 + i, 50, 90, 0.90, 2.2, 64, 9.0, 20.0, 1.25, 13.50, 0.85)
                 for i in range(1, 5)
             ],
             "Cluster_SIC_Sensitivity": [
-                _scenario_template("NOMA_ONLY", "Cluster_SIC_Sensitivity", i, "NOMA SIC sensitivity under residual interference", 235 + i, 88 + i, 52, 92, 0.86, 2.3, 64, 9.2, 21.0)
+                _scenario_template("NOMA_ONLY", "Cluster_SIC_Sensitivity", i, "NOMA SIC sensitivity under residual interference", 235 + i, 88 + i, 52, 92, 0.86, 2.3, 64, 9.2, 21.0, 1.20, 13.00, 0.84)
                 for i in range(1, 4)
             ],
             "Cluster_Cell_Edge": [
-                _scenario_template("NOMA_ONLY", "Cluster_Cell_Edge", i, "NOMA far-user cell-edge stress", 260 + i * 3, 92 + i, 56, 98, 0.76, 2.5, 64, 9.6, 19.0)
+                _scenario_template("NOMA_ONLY", "Cluster_Cell_Edge", i, "NOMA far-user cell-edge stress", 260 + i * 3, 92 + i, 56, 98, 0.76, 2.5, 64, 9.6, 19.0, 1.10, 12.60, 0.83)
                 for i in range(1, 4)
             ],
         },
         "JOINT": {
             "Cluster_Interference_Canyon": [
-                _scenario_template("JOINT", "Cluster_Interference_Canyon", i, "Joint RIS-NOMA urban canyon interference", 245 + i, 92 + i, 57, 102 + i, 0.80, 2.4, 192, 10.0, 24.0)
+                _scenario_template("JOINT", "Cluster_Interference_Canyon", i, "Joint RIS-NOMA urban canyon interference", 245 + i, 92 + i, 57, 102 + i, 0.80, 2.4, 192, 10.0, 24.0, 1.35, 15.50, 0.86)
                 for i in range(1, 5)
             ],
             "Cluster_MultiPath_Shear": [
-                _scenario_template("JOINT", "Cluster_MultiPath_Shear", i, "Joint sheared multipath with dynamic blockage", 238 + i, 86 + i, 54, 96 + i, 0.84, 2.3, 224, 10.5, 25.0)
+                _scenario_template("JOINT", "Cluster_MultiPath_Shear", i, "Joint sheared multipath with dynamic blockage", 238 + i, 86 + i, 54, 96 + i, 0.84, 2.3, 224, 10.5, 25.0, 1.40, 16.00, 0.87)
                 for i in range(1, 4)
             ],
             "Cluster_Dense_Hotspot": [
-                _scenario_template("JOINT", "Cluster_Dense_Hotspot", i, "Joint dense hotspot with reflected congestion", 250 + i * 2, 95 + i, 58, 106 + i, 0.79, 2.5, 256, 11.0, 23.5)
+                _scenario_template("JOINT", "Cluster_Dense_Hotspot", i, "Joint dense hotspot with reflected congestion", 250 + i * 2, 95 + i, 58, 106 + i, 0.79, 2.5, 256, 11.0, 23.5, 1.30, 15.20, 0.86)
                 for i in range(1, 4)
             ],
         },
@@ -141,6 +148,9 @@ def build_hierarchical_scenarios() -> Tuple[Dict[str, Dict[str, List[Dict]]], Di
             256,
             8.8,
             27.0,
+            1.75,
+            3.60,
+            0.82,
         ),
         "TEST_NOMA": _scenario_template(
             "NOMA_ONLY",
@@ -156,6 +166,9 @@ def build_hierarchical_scenarios() -> Tuple[Dict[str, Dict[str, List[Dict]]], Di
             64,
             10.2,
             18.5,
+            1.30,
+            13.80,
+            0.85,
         ),
         "TEST_JOINT": _scenario_template(
             "JOINT",
@@ -171,6 +184,9 @@ def build_hierarchical_scenarios() -> Tuple[Dict[str, Dict[str, List[Dict]]], Di
             320,
             11.5,
             28.0,
+            1.45,
+            16.40,
+            0.88,
         ),
     }
     return train, tests
@@ -197,6 +213,9 @@ def _log_header(csv_path: str) -> None:
                 "noma_u1_power_ratio",
                 "ris_u3_snr",
                 "scenario_type",
+                "eepsu",
+                "pws",
+                "jain_fairness",
                 "domain_utility_score",
             ]
         )
@@ -215,6 +234,9 @@ def _append_log(csv_path: str, row: Dict) -> None:
                 row["noma_u1_power_ratio"],
                 row["ris_u3_snr"],
                 row["scenario_type"],
+                row["eepsu"],
+                row["pws"],
+                row["jain_fairness"],
                 row["domain_utility_score"],
             ]
         )
@@ -238,9 +260,12 @@ def _log_event(
             "phase_name": phase_name,
             "agent_iterations": run_output["agent_iterations"],
             "sum_rate": result["sum_rate"],
-            "noma_u1_power_ratio": params.get("noma_power_split", result.get("noma_u1_power_ratio", 0.0)),
+            "noma_u1_power_ratio": params["noma_power_split"],
             "ris_u3_snr": result["ris_u3_snr"],
             "scenario_type": scenario_type,
+            "eepsu": result["eepsu"],
+            "pws": result["pws"],
+            "jain_fairness": result["jain_fairness"],
             "domain_utility_score": result["domain_utility_score"],
         },
     )

@@ -17,3 +17,8 @@
 # Ignore virtual environment
 **/venv/**
 
+
+artifacts/
+snapshots/
+figures/
+
