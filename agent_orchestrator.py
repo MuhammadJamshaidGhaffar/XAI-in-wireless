@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import copy
 import json
 import re
 from typing import Any, Dict, List, Optional
+
+import math
 
 
 class AgentOrchestrator:
@@ -23,10 +26,71 @@ class AgentOrchestrator:
         matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
         return [m.strip() for m in matches if m.strip()]
 
-    def _call_llm(self, prompt: str, max_new_tokens: int = 350) -> str:
+    @staticmethod
+    def _extract_json_candidates(text: str) -> List[str]:
+        candidates: List[str] = []
+
+        # 0) Honor explicit markers when present.
+        marker_match = re.search(r"BEGIN_JSON\s*(\{[\s\S]*?\})\s*END_JSON", text, flags=re.IGNORECASE)
+        if marker_match:
+            candidates.append(marker_match.group(1).strip())
+
+        # 1) Prefer fenced json blocks when present.
+        for m in re.finditer(r"```json\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE):
+            candidates.append(m.group(1).strip())
+
+        # 2) Fallback: collect balanced {...} objects and try each.
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        candidates.append(text[start : i + 1].strip())
+                        start = -1
+
+        # 3) Try whole text as a last resort.
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+
+        # Deduplicate while preserving order.
+        deduped: List[str] = []
+        seen = set()
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                deduped.append(c)
+        return deduped
+
+    def _call_llm(self, prompt: str, max_new_tokens: int = 4096) -> str:
         if self.llm_pipeline is None:
             raise RuntimeError("LLM pipeline is not available. Program must stop.")
-        out = self.llm_pipeline(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+
+        # Use an explicit generation config to avoid conflicts with model defaults.
+        gen_cfg = None
+        if hasattr(self.llm_pipeline, "model") and hasattr(self.llm_pipeline.model, "generation_config"):
+            # Some transformers versions do not provide GenerationConfig.clone().
+            gen_cfg = copy.deepcopy(self.llm_pipeline.model.generation_config)
+            gen_cfg.max_new_tokens = int(max_new_tokens)
+            gen_cfg.do_sample = False
+            if hasattr(self.llm_pipeline, "tokenizer") and self.llm_pipeline.tokenizer is not None:
+                eos_id = getattr(self.llm_pipeline.tokenizer, "eos_token_id", None)
+                if eos_id is not None:
+                    gen_cfg.pad_token_id = eos_id
+            if hasattr(gen_cfg, "max_length"):
+                gen_cfg.max_length = None
+
+        if gen_cfg is not None:
+            out = self.llm_pipeline(prompt, generation_config=gen_cfg, use_cache=False)
+        else:
+            out = self.llm_pipeline(prompt, max_new_tokens=max_new_tokens, do_sample=False, use_cache=False)
+
         if isinstance(out, list) and out:
             first = out[0]
             if isinstance(first, dict):
@@ -37,15 +101,23 @@ class AgentOrchestrator:
 
     def _parse_json(self, text: str) -> Dict:
         cleaned = self.strip_think_tags(text)
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start == -1 or end == -1 or end < start:
+        candidates = self._extract_json_candidates(cleaned)
+        if not candidates:
             raise ValueError(f"No JSON object found in LLM output: {cleaned[:600]}")
-        payload = cleaned[start : end + 1]
-        try:
-            return json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON from LLM: {exc}; payload={payload[:600]}") from exc
+
+        last_err: Optional[Exception] = None
+        for payload in candidates:
+            try:
+                parsed = json.loads(payload)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError as exc:
+                last_err = exc
+                continue
+
+        if last_err is not None:
+            raise ValueError(f"Invalid JSON from LLM: {last_err}; sample={candidates[0][:600]}") from last_err
+        raise ValueError(f"LLM output did not contain a valid JSON object: {cleaned[:600]}")
 
     @staticmethod
     def _require_keys(data: Dict, keys: List[str], agent_name: str) -> None:
@@ -57,6 +129,25 @@ class AgentOrchestrator:
     def _ensure_allowed_value(value: str, allowed: List[str], field_name: str, agent_name: str) -> None:
         if value not in allowed:
             raise ValueError(f"{agent_name} invalid {field_name}={value}; allowed={allowed}")
+
+    @staticmethod
+    def _to_numeric_scalar(value: Any, field_name: str, agent_name: str) -> float:
+        if isinstance(value, bool):
+            raise ValueError(f"{agent_name} field '{field_name}' must be numeric scalar; got bool")
+        if isinstance(value, (int, float)):
+            value_f = float(value)
+            if not math.isfinite(value_f):
+                raise ValueError(f"{agent_name} field '{field_name}' must be finite numeric scalar")
+            return value_f
+        if isinstance(value, str):
+            value_f = float(value.strip())
+            if not math.isfinite(value_f):
+                raise ValueError(f"{agent_name} field '{field_name}' must be finite numeric scalar")
+            return value_f
+        # LLMs sometimes emit one field as a list; accept by extracting first scalar element.
+        if isinstance(value, (list, tuple)) and len(value) > 0:
+            return AgentOrchestrator._to_numeric_scalar(value[0], field_name, agent_name)
+        raise ValueError(f"{agent_name} field '{field_name}' must be numeric scalar; got type={type(value).__name__}")
 
     @staticmethod
     def _categorize_user_location(distance: float) -> str:
@@ -127,9 +218,19 @@ class AgentOrchestrator:
         base = (
             "You are the Coordinator Agent for a multi-user wireless network.\n"
             "You are a strategic decision-maker.\n"
+            "Return the FINAL answer immediately as JSON (single object).\n"
             "Optimization priority: (1) Fairness, (2) EEPSU, (3) PWS.\n"
             "Use categorized scenario values only.\n"
             "Do not output raw CSI-level vectors.\n"
+            "CRITICAL OUTPUT RULES:\n"
+            "- Final answer must contain exactly one JSON object.\n"
+            "- If you emit <think>...</think>, place it before the JSON object.\n"
+            "- After optional think tags, output JSON only (single object).\n"
+            "- Do not wrap output in markdown, code fences, or commentary.\n"
+            "- Do not include plain-text reasoning outside <think> tags or the final JSON.\n"
+            "- 'actions' must be a non-empty list.\n"
+            "- Each action must include keys: action_type, solver_name, params, call.\n"
+            "- Numeric values must be scalars (not arrays), unless field is selected_user_indices.\n"
             "You must output STRICT JSON only with schema:\n"
             "{\n"
             "  \"actions\": [\n"
@@ -139,8 +240,10 @@ class AgentOrchestrator:
             "}\n"
             "You may include one or more actions in the same iteration.\n"
             "If you choose base-power control, use action_type='increase_base_power' and solver_name='none'.\n"
+            "For base power params, preferred key is target_base_power_dbm. Accepted aliases: base_power_dbm, target_power_dbm, power_dbm.\n"
             "Base power must stay within [base_power_dbm_min, base_power_dbm_max].\n"
             "Near users that are SATISFIED should not consume extra RIS resources.\n"
+            "If multiple actions are needed, include all of them in the SAME actions array for this iteration.\n"
         )
         if category == "RIS_ONLY":
             return (
@@ -149,7 +252,9 @@ class AgentOrchestrator:
                 "Allowed action_type: solve_ris, increase_base_power. You may call both in the same iteration.\n"
                 "For solve_ris params keys: selected_user_indices, phase_resolution, reflection_elements, ris_algorithm.\n"
                 "ris_algorithm must be one of: alternating_optimization, manifold, greedy, gradient_descent.\n"
-                "Each entry in actions must use call text like: CALL: solve_ris(...) or CALL: increase_base_power(...)."
+                "Each entry in actions must use call text like: CALL: solve_ris(...) or CALL: increase_base_power(...).\n"
+                "Valid example:\n"
+                "{\"actions\":[{\"action_type\":\"solve_ris\",\"solver_name\":\"solve_ris\",\"params\":{\"selected_user_indices\":[1],\"phase_resolution\":16,\"reflection_elements\":128,\"ris_algorithm\":\"manifold\"},\"call\":\"CALL: solve_ris(...)\"},{\"action_type\":\"increase_base_power\",\"solver_name\":\"none\",\"params\":{\"target_base_power_dbm\":39.5},\"call\":\"CALL: increase_base_power(...)\"}],\"justification\":\"...\"}"
             )
         if category == "NOMA_ONLY":
             return (
@@ -158,7 +263,9 @@ class AgentOrchestrator:
                 "Allowed action_type: solve_noma, increase_base_power. You may call both in the same iteration.\n"
                 "For solve_noma params keys must be exactly: h, P_max, sigma_sq, min_rate.\n"
                 "Use function call form: solve_noma(h, P_max, sigma_sq, min_rate).\n"
-                "Each entry in actions must use call text like: CALL: solve_noma(...) or CALL: increase_base_power(...)."
+                "Each entry in actions must use call text like: CALL: solve_noma(...) or CALL: increase_base_power(...).\n"
+                "Valid example:\n"
+                "{\"actions\":[{\"action_type\":\"solve_noma\",\"solver_name\":\"solve_noma\",\"params\":{\"h\":{\"h_far\":0.004,\"h_near\":0.011},\"P_max\":8.0,\"sigma_sq\":1e-9,\"min_rate\":2.0},\"call\":\"CALL: solve_noma(...)\"},{\"action_type\":\"increase_base_power\",\"solver_name\":\"none\",\"params\":{\"target_base_power_dbm\":40.0},\"call\":\"CALL: increase_base_power(...)\"}],\"justification\":\"...\"}"
             )
         return (
             base
@@ -166,7 +273,9 @@ class AgentOrchestrator:
             "For solve_noma params keys: h, P_max, sigma_sq, min_rate.\n"
             "For solve_ris params keys: selected_user_indices, phase_resolution, reflection_elements, ris_algorithm.\n"
             "You can include any subset of these actions in one turn.\n"
-            "Each entry in actions must use call text like: CALL: solve_noma(...) / CALL: solve_ris(...) / CALL: increase_base_power(...)."
+            "Each entry in actions must use call text like: CALL: solve_noma(...) / CALL: solve_ris(...) / CALL: increase_base_power(...).\n"
+            "Valid example with all three actions in one iteration:\n"
+            "{\"actions\":[{\"action_type\":\"solve_noma\",\"solver_name\":\"solve_noma\",\"params\":{\"h\":{\"h_far\":0.003,\"h_near\":0.010},\"P_max\":9.0,\"sigma_sq\":1e-9,\"min_rate\":2.0},\"call\":\"CALL: solve_noma(...)\"},{\"action_type\":\"solve_ris\",\"solver_name\":\"solve_ris\",\"params\":{\"selected_user_indices\":[1],\"phase_resolution\":16,\"reflection_elements\":192,\"ris_algorithm\":\"alternating_optimization\"},\"call\":\"CALL: solve_ris(...)\"},{\"action_type\":\"increase_base_power\",\"solver_name\":\"none\",\"params\":{\"target_base_power_dbm\":39.0},\"call\":\"CALL: increase_base_power(...)\"}],\"justification\":\"...\"}"
         )
 
     @staticmethod
@@ -178,7 +287,14 @@ class AgentOrchestrator:
             "You are the Evaluator Agent in a multi-turn optimization dialogue.\n"
             f"Domain context: {domain_line}.\n"
             "Do NOT output a concept/policy.\n"
-            "You must guide the next coordinator turn and provide a refined RAG query.\n"
+            "Return the FINAL answer immediately as JSON (single object).\n"
+            "You must guide the next coordinator turn and MAY provide a refined RAG query.\n"
+            "CRITICAL OUTPUT RULES:\n"
+            "- Return JSON only (single object).\n"
+            "- First non-space character MUST be '{' and last non-space character MUST be '}'.\n"
+            "- No markdown/code fences/commentary.\n"
+            "- If <think> tags are emitted, they must be before JSON and nowhere else.\n"
+            "- rag_query is optional and may be null.\n"
             "Optimization criteria: all users satisfied first, then maximize EEPSU and PWS.\n"
             "Output STRICT JSON only with schema:\n"
             "{\n"
@@ -186,7 +302,9 @@ class AgentOrchestrator:
             "  \"guidance\": \"what coordinator should change next\",\n"
             "  \"rag_query\": \"optional scenario description for next retrieval\",\n"
             "  \"diagnosis\": \"brief reason based on EEPSU/PWS/fairness\"\n"
-            "}"
+            "}\n"
+            "Valid example:\n"
+            "{\"action\":\"continue\",\"guidance\":\"increase fairness by targeting unsatisfied far user via solve_ris and tune solve_noma for min_rate compliance\",\"rag_query\":null,\"diagnosis\":\"fairness below threshold while EEPSU is acceptable\"}"
         )
 
     def _summarize_history_if_needed(self, history: List[Dict]) -> List[Dict]:
@@ -198,7 +316,8 @@ class AgentOrchestrator:
             "Return STRICT JSON with keys: summary, preserved_actions, preserved_failures.\n"
             f"History: {json.dumps(history)}"
         )
-        parsed = self._parse_json(self._call_llm(prompt, max_new_tokens=350))
+        raw = self._call_llm(prompt, max_new_tokens=3072)
+        parsed = self._parse_json(raw)
         self._require_keys(parsed, ["summary", "preserved_actions", "preserved_failures"], "HistorySummarizer")
         return [
             {
@@ -226,11 +345,41 @@ class AgentOrchestrator:
             action_type = str(action["action_type"])
             solver_name = str(action["solver_name"])
             params = action["params"]
+            if not isinstance(params, dict):
+                raise ValueError(f"Action #{idx} field 'params' must be an object")
 
             if action_type == "increase_base_power":
-                if "target_base_power_dbm" not in params:
-                    raise ValueError("increase_base_power params must include target_base_power_dbm")
-                power_dbm = float(params["target_base_power_dbm"])
+                def _find_power_value(payload: Dict) -> Optional[Any]:
+                    direct_keys = [
+                        "target_base_power_dbm",
+                        "base_power_dbm",
+                        "target_power_dbm",
+                        "power_dbm",
+                        "power",
+                        "tx_power_dbm",
+                    ]
+                    for key in direct_keys:
+                        if key in payload:
+                            val = payload[key]
+                            if isinstance(val, dict):
+                                nested = _find_power_value(val)
+                                if nested is not None:
+                                    return nested
+                            else:
+                                return val
+                    return None
+
+                power_raw = _find_power_value(params)
+                if power_raw is None:
+                    raise ValueError(
+                        "increase_base_power params must include one of: "
+                        "target_base_power_dbm|base_power_dbm|target_power_dbm|power_dbm|power|tx_power_dbm"
+                    )
+                power_dbm = AgentOrchestrator._to_numeric_scalar(
+                    power_raw,
+                    "target_base_power_dbm",
+                    "CoordinatorAgent",
+                )
                 p_min = float(scenario["base_power_dbm_min"])
                 p_max = float(scenario["base_power_dbm_max"])
                 if power_dbm < p_min or power_dbm > p_max:
@@ -255,9 +404,17 @@ class AgentOrchestrator:
                         "action_type": "solve_noma",
                         "solve_noma": {
                             "h": params["h"],
-                            "P_max": float(params["P_max"]),
-                            "sigma_sq": float(params["sigma_sq"]),
-                            "min_rate": float(params["min_rate"]),
+                            "P_max": AgentOrchestrator._to_numeric_scalar(params["P_max"], "P_max", "CoordinatorAgent"),
+                            "sigma_sq": AgentOrchestrator._to_numeric_scalar(
+                                params["sigma_sq"],
+                                "sigma_sq",
+                                "CoordinatorAgent",
+                            ),
+                            "min_rate": AgentOrchestrator._to_numeric_scalar(
+                                params["min_rate"],
+                                "min_rate",
+                                "CoordinatorAgent",
+                            ),
                         },
                     }
                 )
@@ -275,8 +432,16 @@ class AgentOrchestrator:
                         "action_type": "solve_ris",
                         "solve_ris": {
                             "selected_user_indices": params["selected_user_indices"],
-                            "phase_resolution": float(params["phase_resolution"]),
-                            "reflection_elements": float(params["reflection_elements"]),
+                            "phase_resolution": AgentOrchestrator._to_numeric_scalar(
+                                params["phase_resolution"],
+                                "phase_resolution",
+                                "CoordinatorAgent",
+                            ),
+                            "reflection_elements": AgentOrchestrator._to_numeric_scalar(
+                                params["reflection_elements"],
+                                "reflection_elements",
+                                "CoordinatorAgent",
+                            ),
                             "ris_algorithm": str(params["ris_algorithm"]),
                         },
                     }
@@ -328,7 +493,7 @@ class AgentOrchestrator:
             "Return JSON only."
         )
 
-        llm_text = self._call_llm(coordinator_prompt)
+        llm_text = self._call_llm(coordinator_prompt, max_new_tokens=8192)
         parsed = self._parse_json(llm_text)
         self._require_keys(parsed, ["actions", "justification"], "CoordinatorAgent")
         actions = parsed.get("actions")
@@ -369,7 +534,7 @@ class AgentOrchestrator:
             f"Chat History: {json.dumps(chat_history)}\n"
             "Return JSON only."
         )
-        llm_text = self._call_llm(evaluator_prompt)
+        llm_text = self._call_llm(evaluator_prompt, max_new_tokens=6144)
         parsed = self._parse_json(llm_text)
         self._require_keys(parsed, ["action", "guidance", "diagnosis"], "EvaluatorAgent")
         if "rag_query" in parsed and parsed["rag_query"] is not None and not isinstance(parsed["rag_query"], str):
@@ -396,9 +561,10 @@ class AgentOrchestrator:
             f"Scenario: {json.dumps(scenario)}\n"
             f"Final Physics Result: {json.dumps(final_result)}\n"
             f"Dialogue History: {json.dumps(chat_history)}\n"
-            "Return JSON only."
+            "Return JSON only.\n"
         )
-        parsed = self._parse_json(self._call_llm(prompt, max_new_tokens=400))
+        raw = self._call_llm(prompt, max_new_tokens=6144)
+        parsed = self._parse_json(raw)
         self._require_keys(parsed, ["condition", "rule", "policy"], "LibrarianAgent")
         parsed["domain"] = domain
         return parsed
@@ -503,7 +669,7 @@ class AgentOrchestrator:
             active_db.learn_concept(
                 condition=concept["condition"],
                 rule=concept["rule"],
-                utility_score=float(final_result["pws"] + final_result["eepsu"]),
+                concept_score=float(final_result["pws"] + final_result["eepsu"]),
                 domain=concept["domain"],
                 policy=concept["policy"],
             )

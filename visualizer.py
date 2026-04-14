@@ -61,14 +61,14 @@ def generate_all_plots(csv_path: str, output_dir: str = "artifacts") -> None:
     fig2.savefig(os.path.join(output_dir, "figure2_zero_shot_vs_mastery.png"))
     plt.close(fig2)
 
-    # Figure 3: Joint Utility Progression
+    # Figure 3: Joint EEPSU Progression
     fig3, ax3 = plt.subplots(figsize=(7, 4.5))
     joint_eval = df[(df["phase_name"] == "Phase 4 Joint Mastery") & (df["scenario_type"] == "test_joint")].sort_values("epoch")
     if not joint_eval.empty:
-        ax3.plot(joint_eval["epoch"], joint_eval["domain_utility_score"], marker="o", linewidth=2.0, color="#ad1457")
+        ax3.plot(joint_eval["epoch"], joint_eval["eepsu"], marker="o", linewidth=2.0, color="#ad1457")
     ax3.set_xlabel("Phase 4 Training Epochs")
-    ax3.set_ylabel("U_JOINT Score")
-    ax3.set_title("Figure 3: Joint Utility Progression")
+    ax3.set_ylabel("EEPSU")
+    ax3.set_title("Figure 3: Joint EEPSU Progression")
     ax3.grid(alpha=0.3)
     fig3.tight_layout()
     fig3.savefig(os.path.join(output_dir, "figure3_joint_utility_progression.png"))
@@ -91,25 +91,21 @@ def generate_all_plots(csv_path: str, output_dir: str = "artifacts") -> None:
     ris_baseline = df[(df["phase_name"] == "Phase 0 Baseline Evaluation") & (df["scenario_type"] == "test_ris")]
     ris_progress = df[(df["phase_name"] == "Phase 1 RIS Learning") & (df["scenario_type"] == "test_ris")].sort_values("epoch")
     ris_x = [0] + ris_progress["epoch"].tolist()
-    ris_y = [float(ris_baseline["domain_utility_score"].iloc[-1]) if not ris_baseline.empty else 0.0] + ris_progress[
-        "domain_utility_score"
-    ].tolist()
+    ris_y = [float(ris_baseline["eepsu"].iloc[-1]) if not ris_baseline.empty else 0.0] + ris_progress["eepsu"].tolist()
     ax5a.plot(ris_x, ris_y, marker="o", color="#2e7d32", linewidth=2.0)
     ax5a.set_title("RIS Domain Mastery")
     ax5a.set_xlabel("Phase 1 Epochs")
-    ax5a.set_ylabel("U_RIS Score")
+    ax5a.set_ylabel("EEPSU")
     ax5a.grid(alpha=0.3)
 
     noma_baseline = df[(df["phase_name"] == "Phase 0 Baseline Evaluation") & (df["scenario_type"] == "test_noma")]
     noma_progress = df[(df["phase_name"] == "Phase 2 NOMA Learning") & (df["scenario_type"] == "test_noma")].sort_values("epoch")
     noma_x = [0] + noma_progress["epoch"].tolist()
-    noma_y = [float(noma_baseline["domain_utility_score"].iloc[-1]) if not noma_baseline.empty else 0.0] + noma_progress[
-        "domain_utility_score"
-    ].tolist()
+    noma_y = [float(noma_baseline["pws"].iloc[-1]) if not noma_baseline.empty else 0.0] + noma_progress["pws"].tolist()
     ax5b.plot(noma_x, noma_y, marker="o", color="#1565c0", linewidth=2.0)
     ax5b.set_title("NOMA Domain Mastery")
     ax5b.set_xlabel("Phase 2 Epochs")
-    ax5b.set_ylabel("U_NOMA Score")
+    ax5b.set_ylabel("PWS")
     ax5b.grid(alpha=0.3)
 
     fig5.suptitle("Figure 5: Independent Domain Mastery", fontweight="bold")

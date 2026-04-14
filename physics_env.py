@@ -19,7 +19,6 @@ class PhysicsResult:
     reflection_efficiency: float
     jain_fairness: float
     sic_error_penalty: float
-    domain_utility_score: float
     noma_u1_power_ratio: float
     ris_u3_snr: float
     scheduled_user_rates_mbps: list
@@ -52,30 +51,6 @@ class PhysicsEnvironment:
         numerator = float(np.sum(rates) ** 2)
         denominator = float(len(rates) * np.sum(rates ** 2) + 1e-12)
         return numerator / denominator
-
-    def calc_ris_utility(
-        self,
-        snr_achieved: float,
-        snr_target: float,
-        reflection_efficiency: float,
-    ) -> float:
-        return self.alpha * (snr_achieved / (snr_target + 1e-12)) + self.beta * reflection_efficiency
-
-    def calc_noma_utility(
-        self,
-        fairness: float,
-        sum_rate: float,
-        sic_error_penalty: float,
-    ) -> float:
-        return self.alpha * fairness + self.beta * sum_rate - self.gamma * sic_error_penalty
-
-    def calc_joint_utility(
-        self,
-        qos_achieved: float,
-        qos_target: float,
-        eepsu: float,
-    ) -> float:
-        return self.alpha * (qos_achieved / (qos_target + 1e-12)) + self.beta * eepsu
 
     @staticmethod
     def _clip01(x: float) -> float:
@@ -363,7 +338,6 @@ class PhysicsEnvironment:
             pws = float(np.dot(np.asarray(weights), np.asarray(scheduled_rates)))
             eepsu = sum_rate / (len(scheduled_rates) * (tx_power_w + 0.01 * ris_elements))
             qos_achieved = sum_rate
-            utility = self.calc_ris_utility(snr_achieved=snr_achieved, snr_target=snr_target, reflection_efficiency=reflection_eff)
 
             fairness = 1.0
             sic_penalty = 0.0
@@ -391,7 +365,6 @@ class PhysicsEnvironment:
             eepsu = sum_rate / (len(scheduled_rates) * (tx_power_w + 0.2))
             qos_achieved = min(rate_far, rate_near)
             snr_achieved = max(sinr_far, sinr_near)
-            utility = self.calc_noma_utility(fairness=fairness, sum_rate=sum_rate, sic_error_penalty=sic_penalty)
 
             noma_ratio = p_far
 
@@ -416,7 +389,6 @@ class PhysicsEnvironment:
             eepsu = sum_rate / (len(scheduled_rates) * (tx_power_w + 0.01 * ris_elements + 0.2))
             qos_achieved = min(rate_far, rate_near)
             snr_achieved = tx_power_w * (h_far + h_near) / (2.0 * noise_w + 1e-18)
-            utility = self.calc_joint_utility(qos_achieved=qos_achieved, qos_target=qos_target, eepsu=eepsu)
 
             noma_ratio = p_far
 
@@ -431,7 +403,6 @@ class PhysicsEnvironment:
             reflection_efficiency=float(reflection_eff),
             jain_fairness=float(fairness),
             sic_error_penalty=float(sic_penalty),
-            domain_utility_score=float(utility),
             noma_u1_power_ratio=float(noma_ratio),
             ris_u3_snr=float(10.0 * math.log10(max(snr_achieved, 1e-12))),
             scheduled_user_rates_mbps=scheduled_rates,

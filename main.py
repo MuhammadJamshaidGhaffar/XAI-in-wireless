@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import logging
 import os
 from typing import Any, Dict, List, Tuple
 
@@ -13,14 +14,56 @@ from visualizer import generate_all_plots
 
 NUM_EPOCHS = 5
 LOG_CSV_PATH = "artifacts/training_log.csv"
+RUN_LOG_PATH = "artifacts/run.log"
+
+
+def _setup_logging() -> logging.Logger:
+    os.makedirs("artifacts", exist_ok=True)
+    logger = logging.getLogger("oran_pipeline")
+    logger.setLevel(logging.INFO)
+    logger.handlers = []
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(fmt)
+
+    file_handler = logging.FileHandler(RUN_LOG_PATH, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(fmt)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+    return logger
 
 
 def _safe_import_llm() -> Any:
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
+        import transformers.utils.import_utils as import_utils
+        try:
+            from transformers.cache_utils import DynamicCache
 
-        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+            # Compatibility shim for remote model code that expects DynamicCache.seen_tokens.
+            if not hasattr(DynamicCache, "seen_tokens"):
+                def _get_seen_tokens(self):  # type: ignore[no-untyped-def]
+                    return getattr(self, "_seen_tokens", 0)
+
+                def _set_seen_tokens(self, value):  # type: ignore[no-untyped-def]
+                    self._seen_tokens = value
+
+                DynamicCache.seen_tokens = property(_get_seen_tokens, _set_seen_tokens)  # type: ignore[attr-defined]
+        except Exception:
+            # If cache utils are unavailable in this transformers build, continue without patching.
+            pass
+
+        # Compatibility shim for older transformers builds used by some DeepSeek remote-code repos.
+        if not hasattr(import_utils, "is_torch_fx_available"):
+            import_utils.is_torch_fx_available = lambda: False
+
+        model_name = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
         use_4bit = bool(torch.cuda.is_available())
         quant_cfg = BitsAndBytesConfig(
             load_in_4bit=use_4bit,
@@ -37,10 +80,23 @@ def _safe_import_llm() -> Any:
             device_map="auto",
             trust_remote_code=True,
         )
+
+        # Normalize generation defaults so per-call config does not conflict.
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            if hasattr(model.generation_config, "max_length"):
+                model.generation_config.max_length = None
+            if hasattr(model.generation_config, "temperature"):
+                model.generation_config.temperature = None
+            if hasattr(model.generation_config, "top_p"):
+                model.generation_config.top_p = None
+
         llm_pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
         return llm_pipe
     except Exception as exc:
-        raise RuntimeError(f"Failed to load DeepSeek pipeline: {exc}") from exc
+        raise RuntimeError(
+            "Failed to load LLM pipeline for deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct. "
+            f"Root error: {exc}"
+        ) from exc
 
 
 def _scenario_template(
@@ -216,7 +272,6 @@ def _log_header(csv_path: str) -> None:
                 "eepsu",
                 "pws",
                 "jain_fairness",
-                "domain_utility_score",
             ]
         )
 
@@ -237,7 +292,6 @@ def _append_log(csv_path: str, row: Dict) -> None:
                 row["eepsu"],
                 row["pws"],
                 row["jain_fairness"],
-                row["domain_utility_score"],
             ]
         )
 
@@ -266,7 +320,6 @@ def _log_event(
             "eepsu": result["eepsu"],
             "pws": result["pws"],
             "jain_fairness": result["jain_fairness"],
-            "domain_utility_score": result["domain_utility_score"],
         },
     )
 
@@ -274,6 +327,8 @@ def _log_event(
 def main() -> None:
     os.makedirs("snapshots", exist_ok=True)
     os.makedirs("artifacts", exist_ok=True)
+    logger = _setup_logging()
+    logger.info("Pipeline start")
 
     train_sets, tests = build_hierarchical_scenarios()
     llm_pipe = _safe_import_llm()
@@ -286,9 +341,11 @@ def main() -> None:
     joint_db = ConceptDatabase(db_path="snapshots/joint_db.pkl")
 
     _log_header(LOG_CSV_PATH)
+    logger.info("CSV logging initialized at %s", LOG_CSV_PATH)
 
     # Phase 0: Baseline Evaluation (Epoch 0)
     phase = "Phase 0 Baseline Evaluation"
+    logger.info("%s: running TEST_RIS/TEST_NOMA/TEST_JOINT", phase)
     p0_ris = orchestrator.run_agentic_evaluation(tests["TEST_RIS"], ["ris"], ris_db)
     _log_event(LOG_CSV_PATH, 0, 1, phase, "test_ris", p0_ris)
 
@@ -300,8 +357,10 @@ def main() -> None:
 
     # Phase 1: RIS Learning
     phase = "Phase 1 RIS Learning"
+    logger.info("%s started", phase)
     ris_train = _flatten_cluster_scenarios(train_sets["RIS_ONLY"])
     for epoch in range(1, NUM_EPOCHS + 1):
+        logger.info("%s epoch %d/%d", phase, epoch, NUM_EPOCHS)
         for idx, scenario in enumerate(ris_train, start=1):
             train_out = orchestrator.run_agentic_optimization(scenario, ["ris"], ris_db)
             _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
@@ -311,8 +370,10 @@ def main() -> None:
 
     # Phase 2: NOMA Learning
     phase = "Phase 2 NOMA Learning"
+    logger.info("%s started", phase)
     noma_train = _flatten_cluster_scenarios(train_sets["NOMA_ONLY"])
     for epoch in range(1, NUM_EPOCHS + 1):
+        logger.info("%s epoch %d/%d", phase, epoch, NUM_EPOCHS)
         for idx, scenario in enumerate(noma_train, start=1):
             train_out = orchestrator.run_agentic_optimization(scenario, ["noma"], noma_db)
             _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
@@ -322,6 +383,7 @@ def main() -> None:
 
     # Phase 3: Zero-Shot Composition
     phase = "Phase 3 Zero-Shot Composition"
+    logger.info("%s started", phase)
     joint_db.memory = [dict(x) for x in copy.deepcopy(ris_db.memory)]
     joint_db._save_to_disk()
     joint_db.merge_with(noma_db)
@@ -331,8 +393,10 @@ def main() -> None:
 
     # Phase 4: Joint Mastery
     phase = "Phase 4 Joint Mastery"
+    logger.info("%s started", phase)
     joint_train = _flatten_cluster_scenarios(train_sets["JOINT"])
     for epoch in range(1, NUM_EPOCHS + 1):
+        logger.info("%s epoch %d/%d", phase, epoch, NUM_EPOCHS)
         for idx, scenario in enumerate(joint_train, start=1):
             train_out = orchestrator.run_agentic_optimization(scenario, ["joint", "ris", "noma"], joint_db)
             _log_event(LOG_CSV_PATH, epoch, idx, phase, "train", train_out)
@@ -347,8 +411,9 @@ def main() -> None:
 
     # Publication plots
     generate_all_plots(LOG_CSV_PATH, output_dir="artifacts")
+    logger.info("Plots generated in artifacts")
 
-    print("Pipeline complete. Artifacts and logs written to ./artifacts")
+    logger.info("Pipeline complete. Artifacts and logs written to ./artifacts")
 
 
 if __name__ == "__main__":

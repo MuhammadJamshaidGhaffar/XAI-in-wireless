@@ -56,7 +56,7 @@ class ConceptDatabase:
         self,
         condition: str,
         rule: str,
-        utility_score: float,
+        concept_score: float,
         domain: str = "joint",
         policy: str = "Learned Policy",
     ) -> None:
@@ -68,7 +68,7 @@ class ConceptDatabase:
                 {
                     "condition": condition,
                     "rule": rule,
-                    "utility_score": float(utility_score),
+                    "concept_score": float(concept_score),
                     "domain": domain,
                     "policy": policy,
                     "embedding": new_embedding,
@@ -87,14 +87,17 @@ class ConceptDatabase:
 
         best_idx = int(np.argmax(sims))
         best_sim = sims[best_idx]
+        best_existing_score = float(
+            self.memory[best_idx].get("concept_score", self.memory[best_idx].get("utility_score", -1e9))
+        )
 
         if best_sim > 0.85:
-            if float(utility_score) > float(self.memory[best_idx].get("utility_score", -1e9)):
+            if float(concept_score) > best_existing_score:
                 self.memory[best_idx].update(
                     {
                         "condition": condition,
                         "rule": rule,
-                        "utility_score": float(utility_score),
+                        "concept_score": float(concept_score),
                         "domain": domain,
                         "policy": policy,
                         "embedding": new_embedding,
@@ -105,7 +108,7 @@ class ConceptDatabase:
                 {
                     "condition": condition,
                     "rule": rule,
-                    "utility_score": float(utility_score),
+                    "concept_score": float(concept_score),
                     "domain": domain,
                     "policy": policy,
                     "embedding": new_embedding,
@@ -163,7 +166,7 @@ class ConceptDatabase:
                     "domain": item.get("domain", "joint"),
                     "condition": item.get("condition", ""),
                     "rule": item.get("rule", ""),
-                    "utility_score": float(item.get("utility_score", 0.0)),
+                    "concept_score": float(item.get("concept_score", item.get("utility_score", 0.0))),
                 }
             )
 
@@ -171,7 +174,7 @@ class ConceptDatabase:
             "You are a formatting assistant for O-RAN concept rulebooks.\n"
             "CRITICAL: NEVER alter scientific wording.\n"
             "CRITICAL: ONLY add Markdown structure with headers for Policy, Condition, and Rule.\n"
-            "Include domain and utility score fields, but do not paraphrase concepts.\n\n"
+            "Include domain and concept score fields, but do not paraphrase concepts.\n\n"
             f"Raw Concepts JSON:\n{json.dumps(records, indent=2)}\n\n"
             "Return Markdown only."
         )
@@ -185,7 +188,7 @@ class ConceptDatabase:
                         f"## Concept {concept['id']}",
                         f"**Policy:** {concept['policy']}",
                         f"**Domain:** {concept['domain']}",
-                        f"**Utility Score:** {concept['utility_score']:.6f}",
+                        f"**Concept Score:** {concept['concept_score']:.6f}",
                         "",
                         "### Condition",
                         concept["condition"],
